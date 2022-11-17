@@ -1,0 +1,141 @@
+// SPCX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+contract MultiSigWallet {
+    event Deposit(address indexed sender, uint amount); //Multisig 지갑에 ETH가 deposit되면 'Deposit' 이벤트 발생
+    event Submit(uint indexed txId); // 거래가 submitted되면 'Submit' 이벤트 발생, 다른 owner 들이 approve하기를 기다림
+    // txId : 거래 ID가 속한 index를 의미함.
+    event Approve(address indexed owner, uint indexed txId); // 다른 owner들이 거래를 승인
+    event Execute(uint indexed txId); // 충분한 양의 거래 approve가 존재하면, 거래 실행
+    event Revoke(address indexed owner, uint indexed txId); // 다른 owner들이 거래 승인 후 생각이 바뀌면 거래 반려
+
+    struct Transaction{
+        address to; // 거래가 진행될 주소
+        uint value; // 전달될 ETH의 양
+        bytes data; // to주소에 보내질 data
+        bool executed; // 거래가 실행되면 executed=1이 됨
+    }
+    
+    address[] public owners; // owner들만이 contract 안에서 대부분의 함수 호출 가능
+    mapping(address => bool) public isOwner; // 입력된 주소가 Multisig 지갑의 owner이면 1, 아니면 0 반환
+    uint public required; // 거래 시작 전 필요 approval의 갯수 저장 : required=2이면 2개 이상의 approval이 있어야 거래 진행
+
+    Transaction[] public transactions; // 모든 거래를 struct 형태로 저장, 각각의 거래는 approval의 갯수 > required 일 때 실행됨
+    
+    mapping(uint => mapping(address => bool)) public approved;
+    // mapping(uint => ) : 거래의 index
+    // mapping(address => bool) : owner의 주소 매핑
+    // 즉, 본 거래가 owner에 의해 approved 됬는지 아닌지 확인
+    // uint=0: 첫번째 거래, uint=1: 두번째 거래, .... : 0부터 시작
+
+    modifier onlyOwner(){ //아래 submit, approve 함수를 owner들만이 사용할 수 있도록 modifier 설정
+        require(isOwner[msg.sender], "now owner"); // 메세지를 보낸 사람(msg.sender)가 isOwner에 해당되지 않으면 "not owner" 메세지 보냄.
+        _; // Owner이면 나머지 함수 실행할 수 있도록 허락
+    }
+
+    modifier txExists(uint _txId) { // 아래 approve 함수에서 approve할 거래의 index가 존재하는지 확인
+        require(_txId < transactions.length, "tx does not exists") // index가 transaction length보다 작으면 그 index는 아직 거래에 포함되지 못한 것
+        _; // 거래가 존재한다면, 나머지 함수 실행할 수 있도록 허락
+    }
+
+    modifier notApproved(uint _txId) { // 아래 approve 함수에서 이 거래가 msg.sender에 의해 아직 승인되지 않았음을 확인
+        require(!approved[_txId][msg.sender], "tx already approved"); // approved 매핑(mapping(uint => mapping(address => bool)) public approved;)을 확인하면 승인되었는지 아닌지 알 수 있음.
+        _; // 거래가 승인되지 않았다면, 나머지 함수 실행
+    }
+
+    modifier notExecuted(uint _txId){ // 아래 approve 함수에서 이 거래가 아직 실행되지 않았음을 확인
+        require(!transactions[_txId].executed, "tx already executed");
+        _; // 거래가 실행되지 않았다면, 나머지 함수 실행
+    }
+
+    constructor(address[] memory _owners, uint _required){  // constructor의 입력 2가지 : owner의 주소, required(필요한 approval의 최소 개수)
+        require(_owners.length > 0, "owners required"); // require는 최소 1개 이상의 owner를 가져야 함.
+        require(_required > 0 && _required <= _owners.length, "invalid required number of owners"); // require의 개수 : 1개 이상, owner 개수 이하
+        
+        for (uint i; i < _owners.length; i++) { //owner를 state 변수에 저장하기 위한 for loop : owner의 개수 != 0, unique owner.
+            address owner = _owners[i]; // 행렬에서 owner의 주소를 받아 변수에 저장
+            
+            require(owner != address(0), "invalid owner"); // owner의 개수 != 0
+            require(!isOwner[owner], "owner is not unique"); // unique한 owner 필요 : address가 isOwner이면 안됨
+
+            // 새로운 owner를 isOwner 매핑에 추가
+            isOwner[owner] = true; 
+            owners.push(owner); // isOwner에 추가
+        }
+
+        required = _required;
+    }
+
+    // 1. Multisig 지갑이 ETH를 받을 수 있도록 함
+    receive() external payable{
+        emit Deposit(msg.sender, msg.value); // ETH를 받으면 Deposit 함수 실행 : event Deposit(address indexed sender, uint amount)
+    }
+
+    // 2. Owner만이 거래 submit 가능, 거래가 Submit이 되고 충분한 approval를 받았다면 어느 owner든 거래 실행 가능
+    function submit(address _to, uint _value, bytes calldata _data) //struct Transaction{address to; uint value; bytes data; bool executed;}이므로
+        external // external function이라는 의미
+        onlyOwner // 오직 owner만이 이 함수 실행 가능하도록 modifier 정의
+    {
+        trasactions.push(Transaction({ //Input으로 받은 (address _to, uint _value, bytes calldata _data)를 transaction 행렬로 보냄
+            to: _to,
+            value: _value,
+            data: _data,
+            executed: false
+        }));
+        emit Submit(transactions.length-1); // Submit 이벤트 실행 event Submit(uint indexed txId); 
+        // 이 때, transactions의 index는 transactions.length-1에 속함
+        // 첫번째 거래 : index 0, 두번째 거래 : index 1, .... : 0부터 시작
+    }
+
+    // 3. 거래가 Submit 된 후에는 다른 Owner들이 Approve 할 수 있음.
+    function approve(uint _txId) // _txId : approve 할 거래의 index
+        external // external function
+        onlyOwner // 오직 owner만이 이 함수 실행 가능
+        txExists(_txId) // approve할 거래의 index가 존재하는지 확인
+        notApproved(_txId) // 이 거래가 msg.sender에 의해 아직 승인되지 않았음을 확인
+        notExecuted(_txId)// 이 거래가 아직 실행되지 않았음을 확인
+    {
+        // 본 거래가 owner에 의해 approved 되었다면, Approve 실행
+        approved[_txId][msg.sender] = true; // mapping(uint => mapping(address => bool)) public approved; 이용
+        emit Approve(msg.sender, _txId) // event Approve(address indexed owner, uint indexed txId);이므로 input 2가지,  이 때의 owner는 msg.sender
+    }
+
+    // 거래를 실행하기 전, Owner는 승인된 approved의 갯수가 required보다 큰 것을 확인해야 함.
+    function _getApprovalCount(uint _txId) private view returns(uint count){ // _txId가 주어졌을 때, approval의 갯수 세기
+        // uint count = 0 : count 초기화 이지만,,, 위에서 (uint count)를 넣음으로써 초기화 필요 없어짐.
+        for (uint i; i < owners.length; i++) { // 각 owner 별로 해당 거래를 승인했는지 안했는지 확인
+            if (approved[_txId][owners[i]]) { // owner[i]가 _txId에 해당하는 거래를 승인했다면 count 1씩 증가
+                count += 1;
+            }
+        }
+        // return count 필요 없음 : 위에서 (uint count)를 넣었기 때문
+    }
+
+    // 4. 거래를 실행할 execute 함수
+    function execute(uint _txId) external txExists(_txId) notExecuted(_txId) { //거래가 존재하고 실행되고 있지 않음을 확인 후 실행
+        require(_getApprovalCount(_txId) >= required, "approvals < required"); // 거래의 승인 갯수가 required보다 많거나 같음을 확인 --> 그래야 거래가 실행될 수 있으므로 
+
+        // Transaction struct 내의 data를 받아온 뒤 업데이트 해야 함 : struct Transaction{address to; uint value; bytes data; bool executed;}
+        Transaction storage transaction = transactions[_txId]; // 거래를 업데이트하므로 storage 사용
+
+        transaction.executed = true; // 거래 실행 == true로 설정
+        
+        (bool success, ) = transaction.to.call{value: transaction.value}(transaction.data); // 거래 실행을 위해 value와 data를 불러오는 것이 성공적인지 확인. 
+        //transaction.value : 보낼 ETH의 양, transaction.data : 보낼 data
+        require(success, "tx failed"); // value와 data를 불러오는 것이 실패할 경우 "tx failed" 메세지 보내기
+
+        emit Execute(_txId) // event Execute(uint indexed txId)이므로 input 1개 필요
+    }
+
+    // 5. owner가 거래를 승인했지만, 거래가 실행되기 전 마음이 바뀐 경우 거래 승인을 반려함.
+    function revoke(uint _txId) 
+        external // external function
+        onlyOwner // 오직 owner만이 이 함수 실행 가능
+        txExists(_txId) // 거래의 index가 존재하는지 확인
+        notExecuted(_txId) // 이 거래가 아직 실행되지 않았음을 확인
+    {
+        require(approved[_txId][msg.sender], "tx not approved"); // 우선, msg.sender가 _txId 거래를 승인했는지부터 확인
+        approved[_txId][msg.sender] = false; //msg.sender가 승인한 거래를 승인 취소함.
+        emit Revoke(msg.sender, _txId); //event Revoke(address indexed owner, uint indexed txId)이므로 input 2개 필요
+    }
+}
